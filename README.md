@@ -40,7 +40,7 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 | `DEFAULT_REPO_URL` | да* | `https://github.com/user/repo` |
 | `DEFAULT_BRANCH` | нет | По умолчанию `main` |
 | `ADMIN_ID` | нет | Ваш Telegram user id |
-| `MAX_DAILY_RUNS` | нет | Лимит в день (по умолчанию 20) |
+| `MAX_DAILY_RUNS` | нет | Лимит в день (по умолчанию 100) |
 | `ALLOWED_USER_IDS` | нет | Пусто = все; иначе `123,456` |
 
 \* Если не задан — каждый пользователь указывает `/repo` сам.

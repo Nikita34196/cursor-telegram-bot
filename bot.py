@@ -30,7 +30,7 @@ CURSOR_API_KEY = os.environ["CURSOR_API_KEY"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL", "").strip()
 DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH", "main").strip() or "main"
-MAX_DAILY_RUNS = int(os.environ.get("MAX_DAILY_RUNS", "20"))
+MAX_DAILY_RUNS = int(os.environ.get("MAX_DAILY_RUNS", "100"))
 AUTO_CREATE_PR = os.environ.get("AUTO_CREATE_PR", "true").lower() in ("1", "true", "yes")
 ALLOWED_USER_IDS = {
     int(x.strip())
