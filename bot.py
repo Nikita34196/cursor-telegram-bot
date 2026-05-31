@@ -18,7 +18,7 @@ from cursor_client import (
     CursorAPIError,
     CursorClient,
     agent_web_url,
-    format_git_links,
+    format_pr_links,
     terminal_statuses,
 )
 from storage import Storage
@@ -401,6 +401,16 @@ def is_busy(chat_id: int) -> bool:
         return bool(_active_runs.get(chat_id, {}).get("busy"))
 
 
+def build_completion_text(status_label: str, result_text: str, git: dict | None) -> str:
+    lines = [status_label]
+    if result_text:
+        lines.append("\n" + result_text[:3500])
+    pr_block = format_pr_links(git)
+    if pr_block:
+        lines.append("\n" + pr_block)
+    return "\n".join(lines)
+
+
 # ─── Run worker (stream + poll fallback) ───────────────────────────────────────
 
 
@@ -415,7 +425,7 @@ def watch_run(
     last_edit = 0.0
     terminal = False
 
-    def update_status(prefix: str, body: str = "") -> None:
+    def update_status(prefix: str, body: str = "", *, finished: bool = False) -> None:
         nonlocal last_edit
         now = time.time()
         if now - last_edit < 2.0 and not terminal:
@@ -424,12 +434,13 @@ def watch_run(
         preview = (prefix + "\n\n" + body).strip()
         if len(preview) > 3900:
             preview = preview[:3900] + "…"
+        markup = None if finished else progress_keyboard(agent_id, agent_url)
         try:
             bot.edit_message_text(
                 preview,
                 chat_id,
                 status_msg_id,
-                reply_markup=progress_keyboard(agent_id, agent_url),
+                reply_markup=markup,
             )
         except Exception:
             pass
@@ -447,18 +458,10 @@ def watch_run(
             terminal = True
             status = data.get("status", "")
             result_text = data.get("text") or "".join(assistant_buf)
-            git_block = format_git_links(data.get("git"))
-            lines = [f"✅ Задача завершена ({status})"]
-            if result_text:
-                lines.append("\n" + result_text[:3500])
-            if git_block:
-                lines.append("\n" + git_block)
-            if agent_url:
-                lines.append(f"\n🔗 {agent_url}")
-            final = "\n".join(lines)
-            update_status(final[:3900])
+            final = build_completion_text(f"✅ Задача завершена ({status})", result_text, data.get("git"))
+            update_status(final[:3900], finished=True)
             if len(final) > 3900:
-                send_chunked(chat_id, final)
+                send_chunked(chat_id, final[3900:])
         elif event == "error":
             terminal = True
             update_status(f"❌ Ошибка стрима: {data.get('message', data)}")
@@ -482,18 +485,11 @@ def watch_run(
         status = run.get("status", "")
         if status in terminal_statuses():
             result_text = run.get("result") or "".join(assistant_buf)
-            git_block = format_git_links(run.get("git"))
             emoji = "✅" if status == "FINISHED" else "⚠️"
-            msg = f"{emoji} {status}"
-            if result_text:
-                msg += f"\n\n{result_text[:3500]}"
-            if git_block:
-                msg += f"\n\n{git_block}"
-            if agent_url:
-                msg += f"\n\n🔗 {agent_url}"
-            update_status(msg[:3900])
+            msg = build_completion_text(f"{emoji} {status}", result_text, run.get("git"))
+            update_status(msg[:3900], finished=True)
             if len(msg) > 3900:
-                send_chunked(chat_id, msg)
+                send_chunked(chat_id, msg[3900:])
             terminal = True
             break
 

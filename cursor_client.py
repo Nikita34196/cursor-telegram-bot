@@ -152,5 +152,17 @@ def format_git_links(git: dict | None) -> str:
     return "\n".join(lines)
 
 
+def format_pr_links(git: dict | None) -> str:
+    """Только PR — без ссылок на ветки и репозиторий."""
+    if not git:
+        return ""
+    lines: list[str] = []
+    for branch in git.get("branches") or []:
+        pr = branch.get("prUrl", "")
+        if pr:
+            lines.append(f"🔀 PR: {pr}")
+    return "\n".join(lines)
+
+
 def terminal_statuses() -> set[str]:
     return {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}
