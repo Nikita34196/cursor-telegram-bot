@@ -47,6 +47,36 @@ store = Storage()
 _active_runs: dict[int, dict] = {}
 _run_lock = threading.Lock()
 
+# chat_id -> "new" | "continue" | "repo" | "branch"
+_pending_prompt: dict[int, str] = {}
+
+# Кнопки меню (Reply Keyboard)
+BTN_NEW = "🆕 Новая задача"
+BTN_CONTINUE = "💬 Продолжить"
+BTN_STATUS = "📊 Статус"
+BTN_LINK = "🔗 Ссылка"
+BTN_REPO = "📦 Репозиторий"
+BTN_BRANCH = "🌿 Ветка"
+BTN_SETTINGS = "⚙️ Настройки"
+BTN_CANCEL = "🛑 Отмена"
+BTN_RESET = "🔄 Сброс"
+BTN_HELP = "❓ Помощь"
+
+MENU_BUTTONS = {
+    BTN_NEW,
+    BTN_CONTINUE,
+    BTN_STATUS,
+    BTN_LINK,
+    BTN_REPO,
+    BTN_BRANCH,
+    BTN_SETTINGS,
+    BTN_CANCEL,
+    BTN_RESET,
+    BTN_HELP,
+}
+
+COMMON_BRANCHES = ("main", "master", "develop", "dev")
+
 GITHUB_REPO_RE = re.compile(
     r"^https?://github\.com/[\w.-]+/[\w.-]+/?$", re.IGNORECASE
 )
@@ -93,6 +123,271 @@ def progress_keyboard(agent_id: str | None, agent_url: str | None = None) -> typ
         )
     )
     return markup
+
+
+def main_menu_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    markup.row(BTN_NEW, BTN_CONTINUE)
+    markup.row(BTN_REPO, BTN_BRANCH)
+    markup.row(BTN_STATUS, BTN_LINK)
+    markup.row(BTN_SETTINGS, BTN_CANCEL)
+    markup.row(BTN_RESET, BTN_HELP)
+    return markup
+
+
+def repo_inline_keyboard() -> types.InlineKeyboardMarkup | None:
+    if not DEFAULT_REPO_URL:
+        return None
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ Использовать по умолчанию",
+            callback_data="repo:default",
+        )
+    )
+    return markup
+
+
+def branch_inline_keyboard(current: str) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup()
+    options: list[str] = []
+    for name in (DEFAULT_BRANCH, *COMMON_BRANCHES):
+        if name and name not in options:
+            options.append(name)
+    row: list[types.InlineKeyboardButton] = []
+    for name in options[:6]:
+        label = f"✓ {name}" if name == current else name
+        row.append(types.InlineKeyboardButton(label, callback_data=f"branch:{name}"))
+        if len(row) == 2:
+            markup.row(*row)
+            row = []
+    if row:
+        markup.row(*row)
+    return markup
+
+
+def apply_repo_url(chat_id: int, url: str) -> str | None:
+    url = url.strip().rstrip("/")
+    if not GITHUB_REPO_RE.match(url):
+        return "❌ Нужен URL вида https://github.com/owner/repo"
+    _, branch = resolve_repo(chat_id)
+    store.set_repo_prefs(chat_id, url, branch)
+    return f"✅ Репозиторий:\n{url}\nВетка: `{branch}`"
+
+
+def apply_branch(chat_id: int, branch: str) -> str | None:
+    branch = branch.strip()
+    if not branch:
+        return "❌ Укажите имя ветки"
+    url, _ = resolve_repo(chat_id)
+    if not url:
+        return "❌ Сначала задайте репозиторий (кнопка «📦 Репозиторий»)."
+    store.set_repo_prefs(chat_id, url, branch)
+    return f"✅ Ветка: `{branch}`"
+
+
+def send_repo_prompt(chat_id: int, reply_to: types.Message | None = None) -> None:
+    _pending_prompt[chat_id] = "repo"
+    url, branch = resolve_repo(chat_id)
+    text = (
+        f"📦 **Репозиторий**\n\n"
+        f"Текущий: {url or '— не задан —'}\n"
+        f"Ветка: `{branch}`\n\n"
+        "Отправьте URL `https://github.com/owner/repo`\n"
+        "или нажмите кнопку ниже."
+    )
+    markup = repo_inline_keyboard()
+    if reply_to:
+        bot.reply_to(
+            reply_to,
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+
+def send_branch_prompt(chat_id: int, reply_to: types.Message | None = None) -> None:
+    _pending_prompt[chat_id] = "branch"
+    url, branch = resolve_repo(chat_id)
+    if not url:
+        text = "❌ Сначала задайте репозиторий (кнопка «📦 Репозиторий»)."
+        if reply_to:
+            bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+        else:
+            bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+        return
+    text = (
+        f"🌿 **Ветка**\n\n"
+        f"Репозиторий: {url}\n"
+        f"Текущая ветка: `{branch}`\n\n"
+        "Выберите ветку кнопкой или отправьте имя текстом."
+    )
+    markup = branch_inline_keyboard(branch)
+    if reply_to:
+        bot.reply_to(
+            reply_to,
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+
+def help_text() -> str:
+    return (
+        "👋 **Cursor Bot**\n\n"
+        "Используйте **кнопки внизу** или пишите задачу текстом — "
+        "Cloud Agent выполнит её в репозитории (как на cursor.com/agents).\n\n"
+        "**Кнопки:**\n"
+        "🆕 Новая задача — новый агент\n"
+        "💬 Продолжить — сообщение текущему агенту\n"
+        "📊 Статус / 🔗 Ссылка / ⚙️ Настройки\n"
+        "📦 Репозиторий / 🌿 Ветка\n"
+        "🛑 Отмена / 🔄 Сброс\n\n"
+        f"Лимит: {MAX_DAILY_RUNS} задач/день."
+    )
+
+
+def send_settings(chat_id: int, reply_to: types.Message | None = None) -> None:
+    url, branch = resolve_repo(chat_id)
+    session = store.get_session(chat_id)
+    lines = [
+        f"📦 Repo: {url or 'не задан'}",
+        f"🌿 Branch: {branch}",
+        f"🔀 Auto-PR: {AUTO_CREATE_PR}",
+    ]
+    if session and session.get("agent_id"):
+        lines.append(f"🤖 Agent: `{session['agent_id']}`")
+        if session.get("agent_url"):
+            lines.append(f"🔗 {session['agent_url']}")
+    text = "\n".join(lines)
+    if reply_to:
+        bot.reply_to(reply_to, text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+
+def send_status(chat_id: int, reply_to: types.Message | None = None) -> None:
+    with _run_lock:
+        active = _active_runs.get(chat_id)
+    session = store.get_session(chat_id)
+    if active:
+        text = (
+            f"⏳ Выполняется run `{active['run_id']}`\n"
+            f"Agent: `{active['agent_id']}`"
+        )
+        if reply_to:
+            bot.reply_to(reply_to, text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        else:
+            bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+    if session and session.get("agent_id"):
+        try:
+            agent = cursor.get_agent(session["agent_id"])
+            text = (
+                f"Агент: {agent.get('status')}\n"
+                f"🔗 {agent.get('url', session.get('agent_url', '—'))}"
+            )
+        except CursorAPIError as e:
+            text = f"❌ {e.message[:300]}"
+    else:
+        text = "Нет активных задач."
+    if reply_to:
+        bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+def send_link(chat_id: int, reply_to: types.Message | None = None) -> None:
+    session = store.get_session(chat_id)
+    if session and session.get("agent_id"):
+        text = agent_web_url(session["agent_id"], session.get("agent_url"))
+    else:
+        text = "Нет активной задачи. Нажмите «🆕 Новая задача» или отправьте текст."
+    if reply_to:
+        bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+def send_cancel(chat_id: int, reply_to: types.Message | None = None) -> None:
+    with _run_lock:
+        active = _active_runs.get(chat_id)
+    session = store.get_session(chat_id)
+    if not active and not session:
+        text = "Нечего отменять."
+        if reply_to:
+            bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+        else:
+            bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+        return
+    agent_id = (active or {}).get("agent_id") or session.get("agent_id")
+    run_id = (active or {}).get("run_id")
+    if not run_id and session:
+        try:
+            agent = cursor.get_agent(agent_id)
+            run_id = agent.get("latestRunId")
+        except CursorAPIError:
+            pass
+    if not run_id:
+        text = "Не найден активный run."
+        if reply_to:
+            bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+        else:
+            bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+        return
+    try:
+        cursor.cancel_run(agent_id, run_id)
+        text = "🛑 Отменено."
+    except CursorAPIError as e:
+        text = f"❌ {e.status}: {e.message[:300]}"
+    if reply_to:
+        bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+def send_reset(chat_id: int, reply_to: types.Message | None = None) -> None:
+    store.clear_session(chat_id)
+    with _run_lock:
+        _active_runs.pop(chat_id, None)
+    _pending_prompt.pop(chat_id, None)
+    text = "🔄 Сессия сброшена. Следующая задача создаст нового агента."
+    if reply_to:
+        bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+
+
+def register_bot_commands() -> None:
+    commands = [
+        telebot.types.BotCommand("start", "Меню и кнопки"),
+        telebot.types.BotCommand("new", "Новая задача"),
+        telebot.types.BotCommand("status", "Статус агента"),
+        telebot.types.BotCommand("link", "Ссылка на задачу"),
+        telebot.types.BotCommand("settings", "Настройки"),
+        telebot.types.BotCommand("cancel", "Отменить задачу"),
+        telebot.types.BotCommand("reset", "Сбросить сессию"),
+        telebot.types.BotCommand("repo", "Репозиторий GitHub"),
+        telebot.types.BotCommand("branch", "Ветка Git"),
+    ]
+    try:
+        bot.set_my_commands(commands)
+    except Exception:
+        pass
 
 
 def set_busy(chat_id: int, busy: bool) -> None:
@@ -235,9 +530,9 @@ def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False)
             if not repo_url:
                 bot.send_message(
                     chat_id,
-                    "📦 Укажите репозиторий:\n"
-                    "/repo https://github.com/user/project\n"
+                    "📦 Укажите репозиторий кнопкой «📦 Репозиторий» "
                     "или задайте DEFAULT_REPO_URL на сервере.",
+                    reply_markup=main_menu_keyboard(),
                 )
                 return
 
@@ -302,20 +597,13 @@ def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False)
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message) -> None:
+    _pending_prompt.pop(message.chat.id, None)
     bot.reply_to(
         message,
-        "👋 **Cursor Bot**\n\n"
-        "Пишите задачу текстом — Cloud Agent выполнит её в репозитории "
-        "(как на cursor.com/agents).\n\n"
-        "**Команды:**\n"
-        "/new — новая тема\n"
-        "/repo /branch — репозиторий GitHub\n"
-        "/link — ссылка на текущую задачу\n"
-        "/status /cancel /reset /settings\n\n"
-        "Обычное сообщение = продолжение диалога.\n"
-        f"Лимит: {MAX_DAILY_RUNS} задач/день.",
+        help_text(),
         parse_mode="Markdown",
         disable_web_page_preview=True,
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -323,7 +611,12 @@ def cmd_start(message: types.Message) -> None:
 def cmd_new(message: types.Message) -> None:
     prompt = message.text.replace("/new", "", 1).strip()
     if not prompt:
-        bot.reply_to(message, "Укажите задачу: /new Добавь README с установкой")
+        _pending_prompt[message.chat.id] = "new"
+        bot.reply_to(
+            message,
+            "✏️ Опишите задачу одним сообщением:",
+            reply_markup=main_menu_keyboard(),
+        )
         return
     start_task(message.chat.id, message.from_user.id, prompt, force_new=True)
 
@@ -332,64 +625,34 @@ def cmd_new(message: types.Message) -> None:
 def cmd_repo(message: types.Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        url, branch = resolve_repo(message.chat.id)
-        bot.reply_to(
-            message,
-            f"Текущий репозиторий:\n{url or '— не задан —'}\nВетка: `{branch}`",
-            parse_mode="Markdown",
-        )
+        send_repo_prompt(message.chat.id, message)
         return
-    url = parts[1].strip().rstrip("/")
-    if not GITHUB_REPO_RE.match(url):
-        bot.reply_to(
-            message,
-            "❌ Нужен URL вида https://github.com/owner/repo",
-        )
-        return
-    _, branch = resolve_repo(message.chat.id)
-    store.set_repo_prefs(message.chat.id, url, branch)
-    bot.reply_to(message, f"✅ Репозиторий:\n{url}\nВетка: `{branch}`", parse_mode="Markdown")
+    result = apply_repo_url(message.chat.id, parts[1])
+    if result and not result.startswith("❌"):
+        _pending_prompt.pop(message.chat.id, None)
+    bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["branch"])
 def cmd_branch(message: types.Message) -> None:
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(message, "Пример: /branch main")
+        send_branch_prompt(message.chat.id, message)
         return
-    branch = parts[1].strip()
-    url, _ = resolve_repo(message.chat.id)
-    if not url:
-        bot.reply_to(message, "Сначала /repo https://github.com/...")
-        return
-    store.set_repo_prefs(message.chat.id, url, branch)
-    bot.reply_to(message, f"✅ Ветка: `{branch}`", parse_mode="Markdown")
+    result = apply_branch(message.chat.id, parts[1])
+    if result and not result.startswith("❌"):
+        _pending_prompt.pop(message.chat.id, None)
+    bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["settings"])
 def cmd_settings(message: types.Message) -> None:
-    url, branch = resolve_repo(message.chat.id)
-    session = store.get_session(message.chat.id)
-    lines = [
-        f"📦 Repo: {url or 'не задан'}",
-        f"🌿 Branch: {branch}",
-        f"🔀 Auto-PR: {AUTO_CREATE_PR}",
-    ]
-    if session and session.get("agent_id"):
-        lines.append(f"🤖 Agent: `{session['agent_id']}`")
-        if session.get("agent_url"):
-            lines.append(f"🔗 {session['agent_url']}")
-    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    send_settings(message.chat.id, message)
 
 
 @bot.message_handler(commands=["link"])
 def cmd_link(message: types.Message) -> None:
-    session = store.get_session(message.chat.id)
-    if session and session.get("agent_id"):
-        url = agent_web_url(session["agent_id"], session.get("agent_url"))
-        bot.reply_to(message, url)
-    else:
-        bot.reply_to(message, "Нет активной задачи. Отправьте текст.")
+    send_link(message.chat.id, message)
 
 
 @bot.message_handler(commands=["admin"])
@@ -411,73 +674,127 @@ def cmd_admin(message: types.Message) -> None:
 
 @bot.message_handler(commands=["status"])
 def cmd_status(message: types.Message) -> None:
-    with _run_lock:
-        active = _active_runs.get(message.chat.id)
-    session = store.get_session(message.chat.id)
-    if active:
-        bot.reply_to(
-            message,
-            f"⏳ Выполняется run `{active['run_id']}`\n"
-            f"Agent: `{active['agent_id']}`",
-            parse_mode="Markdown",
-        )
-        return
-    if session and session.get("agent_id"):
-        try:
-            agent = cursor.get_agent(session["agent_id"])
-            bot.reply_to(
-                message,
-                f"Агент: {agent.get('status')}\n"
-                f"🔗 {agent.get('url', session.get('agent_url', '—'))}",
-            )
-        except CursorAPIError as e:
-            bot.reply_to(message, f"❌ {e.message[:300]}")
-    else:
-        bot.reply_to(message, "Нет активных задач.")
+    send_status(message.chat.id, message)
 
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message: types.Message) -> None:
-    with _run_lock:
-        active = _active_runs.get(message.chat.id)
-    session = store.get_session(message.chat.id)
-    if not active and not session:
-        bot.reply_to(message, "Нечего отменять.")
-        return
-    agent_id = (active or {}).get("agent_id") or session.get("agent_id")
-    run_id = (active or {}).get("run_id")
-    if not run_id and session:
-        try:
-            agent = cursor.get_agent(agent_id)
-            run_id = agent.get("latestRunId")
-        except CursorAPIError:
-            pass
-    if not run_id:
-        bot.reply_to(message, "Не найден активный run.")
-        return
-    try:
-        cursor.cancel_run(agent_id, run_id)
-        bot.reply_to(message, "🛑 Отменено.")
-    except CursorAPIError as e:
-        bot.reply_to(message, f"❌ {e.status}: {e.message[:300]}")
+    send_cancel(message.chat.id, message)
 
 
 @bot.message_handler(commands=["reset"])
 def cmd_reset(message: types.Message) -> None:
-    store.clear_session(message.chat.id)
-    with _run_lock:
-        _active_runs.pop(message.chat.id, None)
-    bot.reply_to(message, "🔄 Сессия сброшена. Следующее сообщение создаст нового агента.")
+    send_reset(message.chat.id, message)
+
+
+@bot.message_handler(func=lambda m: m.text in MENU_BUTTONS)
+def handle_menu_button(message: types.Message) -> None:
+    chat_id = message.chat.id
+    text = message.text
+
+    if text == BTN_NEW:
+        _pending_prompt[chat_id] = "new"
+        bot.reply_to(
+            message,
+            "✏️ Опишите **новую** задачу одним сообщением:",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    elif text == BTN_CONTINUE:
+        session = store.get_session(chat_id)
+        if not session or not session.get("agent_id"):
+            bot.reply_to(
+                message,
+                "Нет активного агента. Нажмите «🆕 Новая задача».",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        _pending_prompt[chat_id] = "continue"
+        bot.reply_to(
+            message,
+            "✏️ Напишите сообщение для текущего агента:",
+            reply_markup=main_menu_keyboard(),
+        )
+    elif text == BTN_STATUS:
+        send_status(chat_id, message)
+    elif text == BTN_LINK:
+        send_link(chat_id, message)
+    elif text == BTN_REPO:
+        send_repo_prompt(chat_id, message)
+    elif text == BTN_BRANCH:
+        send_branch_prompt(chat_id, message)
+    elif text == BTN_SETTINGS:
+        send_settings(chat_id, message)
+    elif text == BTN_CANCEL:
+        send_cancel(chat_id, message)
+    elif text == BTN_RESET:
+        send_reset(chat_id, message)
+    elif text == BTN_HELP:
+        bot.reply_to(
+            message,
+            help_text(),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith(("repo:", "branch:")))
+def handle_inline_callback(call: types.CallbackQuery) -> None:
+    chat_id = call.message.chat.id
+    data = call.data or ""
+
+    if data == "repo:default":
+        if not DEFAULT_REPO_URL:
+            bot.answer_callback_query(call.id, "Репозиторий по умолчанию не задан")
+            return
+        result = apply_repo_url(chat_id, DEFAULT_REPO_URL)
+        _pending_prompt.pop(chat_id, None)
+        bot.answer_callback_query(call.id, "Репозиторий обновлён")
+        bot.send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+
+    if data.startswith("branch:"):
+        branch = data.split(":", 1)[1]
+        result = apply_branch(chat_id, branch)
+        if result and not result.startswith("❌"):
+            _pending_prompt.pop(chat_id, None)
+            bot.answer_callback_query(call.id, f"Ветка: {branch}")
+        else:
+            bot.answer_callback_query(call.id, "Ошибка")
+        bot.send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
 def handle_text(message: types.Message) -> None:
     if not message.text:
         return
-    start_task(message.chat.id, message.from_user.id, message.text.strip())
+    chat_id = message.chat.id
+    prompt = message.text.strip()
+    pending = _pending_prompt.pop(chat_id, None)
+    if pending == "new":
+        start_task(chat_id, message.from_user.id, prompt, force_new=True)
+        return
+    if pending == "continue":
+        start_task(chat_id, message.from_user.id, prompt, force_new=False)
+        return
+    if pending == "repo":
+        result = apply_repo_url(chat_id, prompt)
+        if result and result.startswith("❌"):
+            _pending_prompt[chat_id] = "repo"
+        bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+    if pending == "branch":
+        result = apply_branch(chat_id, prompt)
+        if result and result.startswith("❌"):
+            _pending_prompt[chat_id] = "branch"
+        bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+    start_task(chat_id, message.from_user.id, prompt)
 
 
 if __name__ == "__main__":
     print("Cursor Telegram Bot starting…")
     print(f"DEFAULT_REPO: {bool(DEFAULT_REPO_URL)}")
+    register_bot_commands()
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
