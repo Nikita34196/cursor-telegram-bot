@@ -5,11 +5,13 @@ Deploy on Railway/Render/Fly.io — always online, no local PC required.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import threading
 import time
 from datetime import date
+from io import BytesIO
 
 import telebot
 from telebot import types
@@ -49,6 +51,23 @@ _run_lock = threading.Lock()
 
 # chat_id -> "new" | "continue" | "repo" | "branch"
 _pending_prompt: dict[int, str] = {}
+
+# chat_id -> список изображений для следующего промпта (Cursor API images[])
+_pending_images: dict[int, list[dict[str, str]]] = {}
+
+# agent_id -> уже отправленные в Telegram пути артефактов
+_sent_artifacts: dict[str, set[str]] = {}
+_artifacts_lock = threading.Lock()
+
+MAX_IMAGES = 5
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_TEXT_FILE_BYTES = 100_000
+MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
+IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+TEXT_MIMES = frozenset(
+    {"text/plain", "text/markdown", "text/x-markdown", "application/json", "text/x-python"}
+)
+IMAGE_ONLY_PROMPT = "Распознай и опиши содержимое приложенного изображения."
 
 # Кнопки меню (Reply Keyboard)
 BTN_NEW = "🆕 Новая задача"
@@ -110,6 +129,182 @@ def send_chunked(chat_id: int, text: str, max_len: int = 4000) -> None:
         return
     for i in range(0, len(text), max_len):
         bot.send_message(chat_id, text[i : i + max_len])
+
+
+def download_telegram_bytes(file_id: str) -> bytes:
+    info = bot.get_file(file_id)
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info.file_path}"
+    return cursor.download_url(url)
+
+
+def guess_image_mime(filename: str, fallback: str = "application/octet-stream") -> str:
+    low = filename.lower()
+    if low.endswith(".png"):
+        return "image/png"
+    if low.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if low.endswith(".gif"):
+        return "image/gif"
+    if low.endswith(".webp"):
+        return "image/webp"
+    return fallback
+
+
+def bytes_to_image_payload(data: bytes, mime_type: str) -> dict[str, str] | None:
+    if len(data) > MAX_IMAGE_BYTES or mime_type not in IMAGE_MIMES:
+        return None
+    return {
+        "data": base64.b64encode(data).decode("ascii"),
+        "mimeType": mime_type,
+    }
+
+
+def add_pending_image(chat_id: int, image: dict[str, str]) -> int:
+    imgs = _pending_images.setdefault(chat_id, [])
+    if len(imgs) >= MAX_IMAGES:
+        return len(imgs)
+    imgs.append(image)
+    return len(imgs)
+
+
+def pop_pending_images(chat_id: int) -> list[dict[str, str]]:
+    return _pending_images.pop(chat_id, [])
+
+
+def clear_pending_images(chat_id: int) -> None:
+    _pending_images.pop(chat_id, None)
+
+
+def read_text_attachment(data: bytes, filename: str) -> str | None:
+    if len(data) > MAX_TEXT_FILE_BYTES:
+        return f"[Файл {filename} слишком большой для включения в промпт]"
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def append_text_file_to_prompt(prompt: str, filename: str, content: str) -> str:
+    block = f"\n\n--- {filename} ---\n{content}"
+    if len(prompt) + len(block) > 8000:
+        return prompt + block[:8000 - len(prompt)]
+    return prompt + block
+
+
+def send_agent_artifacts(chat_id: int, agent_id: str) -> None:
+    try:
+        resp = cursor.list_artifacts(agent_id)
+    except CursorAPIError:
+        return
+
+    items = resp.get("items") or []
+    if not items:
+        return
+
+    with _artifacts_lock:
+        sent = _sent_artifacts.setdefault(agent_id, set())
+        new_items = [it for it in items if it.get("path") and it["path"] not in sent]
+
+    for item in new_items:
+        path = item["path"]
+        try:
+            dl = cursor.get_artifact_download_url(agent_id, path)
+            url = dl.get("url")
+            if not url:
+                continue
+            data = cursor.download_url(url)
+            filename = path.rsplit("/", 1)[-1]
+            if len(data) > MAX_ARTIFACT_BYTES:
+                bot.send_message(
+                    chat_id,
+                    f"📎 Файл слишком большой для Telegram: `{filename}`",
+                    parse_mode="Markdown",
+                )
+                with _artifacts_lock:
+                    sent.add(path)
+                continue
+            mime = guess_image_mime(filename)
+            caption = f"📎 {filename}"
+            if mime in IMAGE_MIMES:
+                bot.send_photo(chat_id, BytesIO(data), caption=caption)
+            else:
+                bot.send_document(
+                    chat_id,
+                    BytesIO(data),
+                    visible_file_name=filename,
+                    caption=caption,
+                )
+            with _artifacts_lock:
+                sent.add(path)
+        except Exception:
+            continue
+
+
+def dispatch_task(
+    chat_id: int,
+    user_id: int,
+    prompt: str,
+    pending: str | None,
+    images: list[dict[str, str]] | None,
+) -> None:
+    imgs = images or None
+    if pending == "new":
+        start_task(chat_id, user_id, prompt, force_new=True, images=imgs)
+    elif pending == "continue":
+        start_task(chat_id, user_id, prompt, force_new=False, images=imgs)
+    else:
+        start_task(chat_id, user_id, prompt, images=imgs)
+
+
+def handle_incoming_image(
+    message: types.Message,
+    data: bytes,
+    mime_type: str,
+    caption: str = "",
+) -> None:
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    image = bytes_to_image_payload(data, mime_type)
+    if not image:
+        bot.reply_to(
+            message,
+            "❌ Изображение не поддерживается или больше 15 МБ.\n"
+            "Форматы: PNG, JPEG, GIF, WebP.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    pending = _pending_prompt.get(chat_id)
+    if pending in ("repo", "branch"):
+        bot.reply_to(
+            message,
+            "Сначала завершите настройку репозитория/ветки текстом.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    caption = caption.strip()
+    if caption:
+        _pending_prompt.pop(chat_id, None)
+        existing = pop_pending_images(chat_id)
+        all_images = (existing + [image])[:MAX_IMAGES]
+        dispatch_task(chat_id, user_id, caption, pending, all_images)
+        return
+
+    count = add_pending_image(chat_id, image)
+    if count >= MAX_IMAGES:
+        bot.reply_to(
+            message,
+            f"📷 Добавлено {count} фото (лимит). Напишите задачу.",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        bot.reply_to(
+            message,
+            f"📷 Фото добавлено ({count}/{MAX_IMAGES}).\n"
+            "Напишите задачу или отправьте ещё фото.",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 def progress_keyboard(agent_id: str | None, agent_url: str | None = None) -> types.InlineKeyboardMarkup | None:
@@ -257,6 +452,9 @@ def help_text() -> str:
         "📊 Статус / 🔗 Ссылка / ⚙️ Настройки\n"
         "📦 Репозиторий / 🌿 Ветка\n"
         "🛑 Отмена / 🔄 Сброс\n\n"
+        "📷 **Файлы:** отправьте фото или изображение (PNG/JPEG/GIF/WebP) — "
+        "можно с подписью или несколько штук + текст задачи.\n"
+        "📎 Cursor может вернуть файлы из `artifacts/` после задачи.\n\n"
         f"Лимит: {MAX_DAILY_RUNS} задач/день."
     )
 
@@ -365,6 +563,7 @@ def send_reset(chat_id: int, reply_to: types.Message | None = None) -> None:
     with _run_lock:
         _active_runs.pop(chat_id, None)
     _pending_prompt.pop(chat_id, None)
+    clear_pending_images(chat_id)
     text = "🔄 Сессия сброшена. Следующая задача создаст нового агента."
     if reply_to:
         bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
@@ -462,6 +661,7 @@ def watch_run(
             update_status(final[:3900], finished=True)
             if len(final) > 3900:
                 send_chunked(chat_id, final[3900:])
+            send_agent_artifacts(chat_id, agent_id)
         elif event == "error":
             terminal = True
             update_status(f"❌ Ошибка стрима: {data.get('message', data)}")
@@ -490,6 +690,7 @@ def watch_run(
             update_status(msg[:3900], finished=True)
             if len(msg) > 3900:
                 send_chunked(chat_id, msg[3900:])
+            send_agent_artifacts(chat_id, agent_id)
             terminal = True
             break
 
@@ -501,7 +702,13 @@ def watch_run(
     set_busy(chat_id, False)
 
 
-def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False) -> None:
+def start_task(
+    chat_id: int,
+    user_id: int,
+    prompt: str,
+    force_new: bool = False,
+    images: list[dict[str, str]] | None = None,
+) -> None:
     if not is_allowed(user_id):
         bot.send_message(chat_id, "⛔ Бот недоступен для вашего аккаунта.")
         return
@@ -539,6 +746,7 @@ def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False)
                 starting_ref=branch,
                 auto_create_pr=AUTO_CREATE_PR,
                 name=agent_name,
+                images=images,
             )
             agent = resp["agent"]
             run = resp["run"]
@@ -550,16 +758,17 @@ def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False)
         else:
             agent_id = session["agent_id"]
             agent_url = session.get("agent_url")
-            resp = cursor.create_run(agent_id, prompt)
+            resp = cursor.create_run(agent_id, prompt, images=images)
             run = resp["run"]
             run_id = run["id"]
             title = "💬 Продолжение диалога с агентом"
 
         store.increment_daily_runs(user_id, date.today().isoformat())
 
+        img_note = f"\n📷 {len(images)} изображ." if images else ""
         status_msg = bot.send_message(
             chat_id,
-            f"{title}\n⏳ Запуск…\n\n{prompt[:500]}",
+            f"{title}\n⏳ Запуск…\n\n{prompt[:500]}{img_note}",
             reply_markup=progress_keyboard(agent_id, agent_url),
         )
 
@@ -594,6 +803,7 @@ def start_task(chat_id: int, user_id: int, prompt: str, force_new: bool = False)
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message: types.Message) -> None:
     _pending_prompt.pop(message.chat.id, None)
+    clear_pending_images(message.chat.id)
     bot.reply_to(
         message,
         help_text(),
@@ -761,19 +971,82 @@ def handle_inline_callback(call: types.CallbackQuery) -> None:
         bot.send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message: types.Message) -> None:
+    if not message.photo:
+        return
+    try:
+        data = download_telegram_bytes(message.photo[-1].file_id)
+    except Exception:
+        bot.reply_to(message, "❌ Не удалось скачать фото.", reply_markup=main_menu_keyboard())
+        return
+    handle_incoming_image(message, data, "image/jpeg", message.caption or "")
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document(message: types.Message) -> None:
+    doc = message.document
+    if not doc:
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    filename = doc.file_name or "file"
+    mime = doc.mime_type or guess_image_mime(filename)
+
+    if _pending_prompt.get(chat_id) in ("repo", "branch"):
+        bot.reply_to(
+            message,
+            "Сначала завершите настройку репозитория/ветки текстом.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        data = download_telegram_bytes(doc.file_id)
+    except Exception:
+        bot.reply_to(message, "❌ Не удалось скачать файл.", reply_markup=main_menu_keyboard())
+        return
+
+    if mime in IMAGE_MIMES or guess_image_mime(filename) in IMAGE_MIMES:
+        image_mime = mime if mime in IMAGE_MIMES else guess_image_mime(filename)
+        handle_incoming_image(message, data, image_mime, message.caption or "")
+        return
+
+    if mime in TEXT_MIMES or filename.lower().endswith((".txt", ".md", ".json", ".py", ".csv")):
+        content = read_text_attachment(data, filename)
+        if content is None:
+            bot.reply_to(
+                message,
+                "❌ Не удалось прочитать файл как UTF-8 текст.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        caption = (message.caption or "").strip() or f"Обработай приложенный файл {filename}"
+        prompt = append_text_file_to_prompt(caption, filename, content)
+        pending = _pending_prompt.pop(chat_id, None)
+        imgs = pop_pending_images(chat_id)
+        dispatch_task(chat_id, user_id, prompt, pending, imgs or None)
+        return
+
+    bot.reply_to(
+        message,
+        "❌ Формат не поддерживается.\n"
+        "Отправьте изображение (PNG/JPEG/GIF/WebP) или текстовый файл (.txt, .md, .json, .py).",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
 def handle_text(message: types.Message) -> None:
     if not message.text:
         return
     chat_id = message.chat.id
+    user_id = message.from_user.id
     prompt = message.text.strip()
     pending = _pending_prompt.pop(chat_id, None)
-    if pending == "new":
-        start_task(chat_id, message.from_user.id, prompt, force_new=True)
-        return
-    if pending == "continue":
-        start_task(chat_id, message.from_user.id, prompt, force_new=False)
-        return
+    images = pop_pending_images(chat_id)
+
     if pending == "repo":
         result = apply_repo_url(chat_id, prompt)
         if result and result.startswith("❌"):
@@ -786,7 +1059,17 @@ def handle_text(message: types.Message) -> None:
             _pending_prompt[chat_id] = "branch"
         bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
-    start_task(chat_id, message.from_user.id, prompt)
+
+    if images and not prompt:
+        prompt = IMAGE_ONLY_PROMPT
+
+    if pending == "new":
+        start_task(chat_id, user_id, prompt, force_new=True, images=images or None)
+        return
+    if pending == "continue":
+        start_task(chat_id, user_id, prompt, force_new=False, images=images or None)
+        return
+    start_task(chat_id, user_id, prompt, images=images or None)
 
 
 if __name__ == "__main__":

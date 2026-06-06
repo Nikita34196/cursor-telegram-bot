@@ -5,8 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 API_BASE = "https://api.cursor.com/v1"
 
@@ -48,8 +49,21 @@ class CursorClient:
             detail = e.read().decode("utf-8", errors="replace")[:500]
             raise CursorAPIError(e.code, detail or str(e)) from e
 
+    @staticmethod
+    def download_url(url: str, timeout: int = 120) -> bytes:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
     def me(self) -> dict:
         return self._request("GET", "/me")
+
+    @staticmethod
+    def _prompt_body(text: str, images: list[dict[str, str]] | None) -> dict[str, Any]:
+        prompt: dict[str, Any] = {"text": text}
+        if images:
+            prompt["images"] = images
+        return prompt
 
     def create_agent(
         self,
@@ -59,9 +73,10 @@ class CursorClient:
         auto_create_pr: bool = True,
         mode: str = "agent",
         name: str | None = None,
+        images: list[dict[str, str]] | None = None,
     ) -> dict:
         payload: dict[str, Any] = {
-            "prompt": {"text": prompt},
+            "prompt": self._prompt_body(prompt, images),
             "mode": mode,
             "autoCreatePR": auto_create_pr,
         }
@@ -71,8 +86,14 @@ class CursorClient:
             payload["repos"] = [{"url": repo_url, "startingRef": starting_ref}]
         return self._request("POST", "/agents", payload)
 
-    def create_run(self, agent_id: str, prompt: str, mode: str | None = None) -> dict:
-        body: dict[str, Any] = {"prompt": {"text": prompt}}
+    def create_run(
+        self,
+        agent_id: str,
+        prompt: str,
+        mode: str | None = None,
+        images: list[dict[str, str]] | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {"prompt": self._prompt_body(prompt, images)}
         if mode:
             body["mode"] = mode
         return self._request("POST", f"/agents/{agent_id}/runs", body)
@@ -93,6 +114,13 @@ class CursorClient:
 
     def list_runs(self, agent_id: str, limit: int = 5) -> dict:
         return self._request("GET", f"/agents/{agent_id}/runs?limit={limit}")
+
+    def list_artifacts(self, agent_id: str) -> dict:
+        return self._request("GET", f"/agents/{agent_id}/artifacts")
+
+    def get_artifact_download_url(self, agent_id: str, path: str) -> dict:
+        query = urllib.parse.urlencode({"path": path})
+        return self._request("GET", f"/agents/{agent_id}/artifacts/download?{query}")
 
     def stream_run(
         self,
