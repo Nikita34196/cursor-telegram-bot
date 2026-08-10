@@ -613,6 +613,20 @@ def build_completion_text(status_label: str, result_text: str, git: dict | None)
 # ─── Run worker (stream + poll fallback) ───────────────────────────────────────
 
 
+def _is_stream_gone_message(message: object) -> bool:
+    """SSE/API may close the live stream while the Cloud Agent run keeps going."""
+    text = str(message or "").lower()
+    return any(
+        needle in text
+        for needle in (
+            "no longer available",
+            "stream_expired",
+            "stream expired",
+            "stream is gone",
+        )
+    )
+
+
 def watch_run(
     chat_id: int,
     agent_id: str,
@@ -624,10 +638,16 @@ def watch_run(
     last_edit = 0.0
     terminal = False
 
-    def update_status(prefix: str, body: str = "", *, finished: bool = False) -> None:
+    def update_status(
+        prefix: str,
+        body: str = "",
+        *,
+        finished: bool = False,
+        force: bool = False,
+    ) -> None:
         nonlocal last_edit
         now = time.time()
-        if now - last_edit < 2.0 and not terminal:
+        if not force and now - last_edit < 2.0 and not terminal:
             return
         last_edit = now
         preview = (prefix + "\n\n" + body).strip()
@@ -658,21 +678,45 @@ def watch_run(
             status = data.get("status", "")
             result_text = data.get("text") or "".join(assistant_buf)
             final = build_completion_text(f"✅ Задача завершена ({status})", result_text, data.get("git"))
-            update_status(final[:3900], finished=True)
+            update_status(final[:3900], finished=True, force=True)
             if len(final) > 3900:
                 send_chunked(chat_id, final[3900:])
             send_agent_artifacts(chat_id, agent_id)
         elif event == "error":
-            terminal = True
-            update_status(f"❌ Ошибка стрима: {data.get('message', data)}")
+            # Stream retention / disconnect is not a run failure — poll Get A Run.
+            err_msg = data.get("message", data)
+            preview = "".join(assistant_buf)[-1200:]
+            if _is_stream_gone_message(err_msg):
+                update_status(
+                    "⚠️ Стрим закрыт, задача продолжается — опрашиваю статус…",
+                    preview,
+                    force=True,
+                )
+            else:
+                update_status(
+                    f"⚠️ Стрим прервался ({err_msg}), проверяю статус задачи…",
+                    preview,
+                    force=True,
+                )
 
     try:
         cursor.stream_run(agent_id, run_id, on_event)
     except CursorAPIError as e:
-        if e.status != 410:
-            update_status(f"⚠️ Стрим недоступен ({e.status}), опрашиваю статус…")
+        preview = "".join(assistant_buf)[-1200:]
+        if e.status == 410 or _is_stream_gone_message(e.message):
+            update_status(
+                "⚠️ Стрим истёк, опрашиваю статус задачи…",
+                preview,
+                force=True,
+            )
+        else:
+            update_status(
+                f"⚠️ Стрим недоступен ({e.status}), опрашиваю статус…",
+                preview,
+                force=True,
+            )
 
-    # Poll until terminal
+    # Poll until terminal (authoritative status after stream ends/expires)
     for _ in range(180):
         if terminal:
             break
@@ -687,7 +731,7 @@ def watch_run(
             result_text = run.get("result") or "".join(assistant_buf)
             emoji = "✅" if status == "FINISHED" else "⚠️"
             msg = build_completion_text(f"{emoji} {status}", result_text, run.get("git"))
-            update_status(msg[:3900], finished=True)
+            update_status(msg[:3900], finished=True, force=True)
             if len(msg) > 3900:
                 send_chunked(chat_id, msg[3900:])
             send_agent_artifacts(chat_id, agent_id)
