@@ -155,10 +155,14 @@ class CursorClient:
                         if event_type:
                             on_event(event_type, data)
         except urllib.error.HTTPError as e:
-            if e.code == 410:
-                raise CursorAPIError(410, "stream_expired") from e
             detail = e.read().decode("utf-8", errors="replace")[:500]
+            lowered = detail.lower()
+            if e.code == 410 or "stream_expired" in lowered or "no longer available" in lowered:
+                raise CursorAPIError(410, detail or "stream_expired") from e
             raise CursorAPIError(e.code, detail or str(e)) from e
+        except (TimeoutError, ConnectionError, BrokenPipeError, urllib.error.URLError) as e:
+            # Dropped SSE socket — caller should poll Get A Run instead.
+            raise CursorAPIError(410, f"stream_disconnected: {e}") from e
 
 
 def agent_web_url(agent_id: str, web_url: str | None = None) -> str:
