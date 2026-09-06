@@ -8,6 +8,7 @@ from pdf_urls import (
     extract_pdf_urls,
     looks_like_pdf_url,
     normalize_pdf_url,
+    onedrive_share_id,
     strip_urls,
 )
 
@@ -25,6 +26,15 @@ class UrlDetectTests(unittest.TestCase):
             normalize_pdf_url(url),
             "https://drive.google.com/uc?export=download&id=abc123XYZ&confirm=t",
         )
+
+    def test_onedrive(self) -> None:
+        url = "https://1drv.ms/b/c/0dc74361cfc7e918/IQBbHsc-fEemTq7piS7hwCXeAR9g2Li6KLxBdkzxG27RSZ0?e=4UruYh"
+        self.assertTrue(looks_like_pdf_url(url))
+        self.assertEqual(extract_pdf_urls(f"конспект {url}"), [url])
+        share = onedrive_share_id(url)
+        self.assertTrue(share.startswith("u!"))
+        self.assertNotIn("=", share)
+        self.assertNotIn("/", share)
 
     def test_dropbox(self) -> None:
         url = "https://www.dropbox.com/s/xx/file.pdf?dl=0"
