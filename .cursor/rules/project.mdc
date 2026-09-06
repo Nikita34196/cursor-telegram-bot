@@ -1,24 +1,13 @@
 ---
-description: Контекст проекта cursor-telegram-bot — не начинать с нуля
+description: Контекст проекта cursor-telegram-bot
 alwaysApply: true
 ---
 
 # cursor-telegram-bot
 
-Проект **уже создан**. Пользователь **не** просит синхронизацию Telegram с приложением Cursor.
+Telegram-бот для Cursor Cloud Agents.
 
-**Перед ответом прочитай `ДАЛЬШЕ.md`.**
+PDF: бот скачивает файл из Telegram (`handle_document` → `parse_pdf`) и передаёт содержимое в Cursor через промпт и `prompt.images` (скриншоты страниц). API Cloud Agents не принимает бинарный PDF напрямую.
 
-## Поведение
+Код: `bot.py`, `cursor_client.py`, `storage.py`, `pdf_attachments.py`.
 
-- Коротко: **один** следующий шаг (`.env`, Railway, ошибка в Telegram).
-- **Не** повторяй полный гайд по BotFather / «что такое бот» / создание с нуля.
-- **Не** предлагай sync с десктопным Cursor, `/attach`, двустороннюю синхронизацию.
-- Код: `bot.py`, `cursor_client.py`, `storage.py`.
-
-## Файлы
-
-| Файл | Зачем |
-|------|--------|
-| `ДАЛЬШЕ.md` | Текущий шаг пользователя |
-| `README.md` | Деплой Railway |

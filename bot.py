@@ -6,6 +6,7 @@ Deploy on Railway/Render/Fly.io — always online, no local PC required.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 import threading
@@ -23,7 +24,16 @@ from cursor_client import (
     format_pr_links,
     terminal_statuses,
 )
+from pdf_attachments import (
+    MAX_PDF_BYTES,
+    PdfAttachmentError,
+    ParsedPdf,
+    looks_like_pdf,
+    merge_into_prompt,
+    parse_pdf,
+)
 from storage import Storage
+from telegram_files import TelegramDownloadError, download_telegram_file
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -55,6 +65,9 @@ _pending_prompt: dict[int, str] = {}
 # chat_id -> список изображений для следующего промпта (Cursor API images[])
 _pending_images: dict[int, list[dict[str, str]]] = {}
 
+# chat_id -> разобранные PDF, которые уйдут в следующий промпт Cursor
+_pending_pdfs: dict[int, list[ParsedPdf]] = {}
+
 # agent_id -> уже отправленные в Telegram пути артефактов
 _sent_artifacts: dict[str, set[str]] = {}
 _artifacts_lock = threading.Lock()
@@ -68,6 +81,7 @@ TEXT_MIMES = frozenset(
     {"text/plain", "text/markdown", "text/x-markdown", "application/json", "text/x-python"}
 )
 IMAGE_ONLY_PROMPT = "Распознай и опиши содержимое приложенного изображения."
+MAX_PENDING_PDFS = 3
 
 # Кнопки меню (Reply Keyboard)
 BTN_NEW = "🆕 Новая задача"
@@ -131,10 +145,22 @@ def send_chunked(chat_id: int, text: str, max_len: int = 4000) -> None:
         bot.send_message(chat_id, text[i : i + max_len])
 
 
-def download_telegram_bytes(file_id: str) -> bytes:
-    info = bot.get_file(file_id)
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info.file_path}"
-    return cursor.download_url(url)
+def download_telegram_bytes(file_id: str, file_size: int | None = None) -> bytes:
+    return download_telegram_file(
+        bot,
+        file_id,
+        token=BOT_TOKEN,
+        file_size=file_size,
+    )
+
+
+def reply_download_error(message: types.Message, exc: BaseException) -> None:
+    if isinstance(exc, TelegramDownloadError):
+        text = f"❌ {exc.user_message}"
+    else:
+        text = f"❌ Не удалось скачать файл: {str(exc)[:280]}"
+    logging.getLogger(__name__).exception("Telegram file download failed")
+    bot.reply_to(message, text, reply_markup=main_menu_keyboard())
 
 
 def guess_image_mime(filename: str, fallback: str = "application/octet-stream") -> str:
@@ -173,6 +199,37 @@ def pop_pending_images(chat_id: int) -> list[dict[str, str]]:
 
 def clear_pending_images(chat_id: int) -> None:
     _pending_images.pop(chat_id, None)
+
+
+def add_pending_pdf(chat_id: int, parsed: ParsedPdf) -> int:
+    pdfs = _pending_pdfs.setdefault(chat_id, [])
+    if len(pdfs) >= MAX_PENDING_PDFS:
+        pdfs.pop(0)
+    pdfs.append(parsed)
+    return len(pdfs)
+
+
+def pop_pending_pdfs(chat_id: int) -> list[ParsedPdf]:
+    return _pending_pdfs.pop(chat_id, [])
+
+
+def clear_pending_pdfs(chat_id: int) -> None:
+    _pending_pdfs.pop(chat_id, None)
+
+
+def consume_pending_attachments(
+    chat_id: int,
+    prompt: str,
+    extra_images: list[dict[str, str]] | None = None,
+    extra_pdfs: list[ParsedPdf] | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    images = pop_pending_images(chat_id)
+    pdfs = pop_pending_pdfs(chat_id)
+    if extra_images:
+        images.extend(extra_images)
+    if extra_pdfs:
+        pdfs.extend(extra_pdfs)
+    return merge_into_prompt(prompt, pdfs, images, max_images=MAX_IMAGES)
 
 
 def read_text_attachment(data: bytes, filename: str) -> str | None:
@@ -286,9 +343,10 @@ def handle_incoming_image(
     caption = caption.strip()
     if caption:
         _pending_prompt.pop(chat_id, None)
-        existing = pop_pending_images(chat_id)
-        all_images = (existing + [image])[:MAX_IMAGES]
-        dispatch_task(chat_id, user_id, caption, pending, all_images)
+        prompt, images = consume_pending_attachments(
+            chat_id, caption, extra_images=[image]
+        )
+        dispatch_task(chat_id, user_id, prompt, pending, images or None)
         return
 
     count = add_pending_image(chat_id, image)
@@ -452,8 +510,10 @@ def help_text() -> str:
         "📊 Статус / 🔗 Ссылка / ⚙️ Настройки\n"
         "📦 Репозиторий / 🌿 Ветка\n"
         "🛑 Отмена / 🔄 Сброс\n\n"
-        "📷 **Файлы:** отправьте фото или изображение (PNG/JPEG/GIF/WebP) — "
-        "можно с подписью или несколько штук + текст задачи.\n"
+        "📷 **Файлы:** фото (PNG/JPEG/GIF/WebP) и **PDF** — "
+        "с подписью-задачей или несколько файлов, затем текст.\n"
+        "📄 PDF скачивается из Telegram, из него извлекается текст и "
+        "скриншоты страниц — это уходит в Cloud Agent.\n"
         "📎 Cursor может вернуть файлы из `artifacts/` после задачи.\n\n"
         f"Лимит: {MAX_DAILY_RUNS} задач/день."
     )
@@ -564,6 +624,7 @@ def send_reset(chat_id: int, reply_to: types.Message | None = None) -> None:
         _active_runs.pop(chat_id, None)
     _pending_prompt.pop(chat_id, None)
     clear_pending_images(chat_id)
+    clear_pending_pdfs(chat_id)
     text = "🔄 Сессия сброшена. Следующая задача создаст нового агента."
     if reply_to:
         bot.reply_to(reply_to, text, reply_markup=main_menu_keyboard())
@@ -809,7 +870,7 @@ def start_task(
 
         store.increment_daily_runs(user_id, date.today().isoformat())
 
-        img_note = f"\n📷 {len(images)} изображ." if images else ""
+        img_note = f"\n📷 {len(images)} влож. для Cursor" if images else ""
         status_msg = bot.send_message(
             chat_id,
             f"{title}\n⏳ Запуск…\n\n{prompt[:500]}{img_note}",
@@ -848,6 +909,7 @@ def start_task(
 def cmd_start(message: types.Message) -> None:
     _pending_prompt.pop(message.chat.id, None)
     clear_pending_images(message.chat.id)
+    clear_pending_pdfs(message.chat.id)
     bot.reply_to(
         message,
         help_text(),
@@ -868,7 +930,14 @@ def cmd_new(message: types.Message) -> None:
             reply_markup=main_menu_keyboard(),
         )
         return
-    start_task(message.chat.id, message.from_user.id, prompt, force_new=True)
+    prompt, images = consume_pending_attachments(message.chat.id, prompt)
+    start_task(
+        message.chat.id,
+        message.from_user.id,
+        prompt,
+        force_new=True,
+        images=images or None,
+    )
 
 
 @bot.message_handler(commands=["repo"])
@@ -1015,14 +1084,60 @@ def handle_inline_callback(call: types.CallbackQuery) -> None:
         bot.send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
+def handle_incoming_pdf(
+    message: types.Message,
+    data: bytes,
+    filename: str,
+) -> None:
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    pending = _pending_prompt.get(chat_id)
+    if pending in ("repo", "branch"):
+        bot.reply_to(
+            message,
+            "Сначала завершите настройку репозитория/ветки текстом.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        parsed = parse_pdf(data, filename, max_page_images=MAX_IMAGES)
+    except PdfAttachmentError as e:
+        bot.reply_to(message, f"❌ {e}", reply_markup=main_menu_keyboard())
+        return
+
+    caption = (message.caption or "").strip()
+    if caption:
+        _pending_prompt.pop(chat_id, None)
+        prompt, images = consume_pending_attachments(
+            chat_id, caption, extra_pdfs=[parsed]
+        )
+        dispatch_task(chat_id, user_id, prompt, pending, images or None)
+        return
+
+    count = add_pending_pdf(chat_id, parsed)
+    extra = f"\n{parsed.warning}" if parsed.warning else ""
+    bot.reply_to(
+        message,
+        f"📄 PDF добавлен: `{filename}` ({parsed.page_count} стр.)\n"
+        f"В очереди: {count}/{MAX_PENDING_PDFS}.{extra}\n"
+        "Напишите задачу или отправьте ещё файлы — содержимое уйдёт в Cursor.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: types.Message) -> None:
     if not message.photo:
         return
     try:
-        data = download_telegram_bytes(message.photo[-1].file_id)
-    except Exception:
-        bot.reply_to(message, "❌ Не удалось скачать фото.", reply_markup=main_menu_keyboard())
+        data = download_telegram_bytes(
+            message.photo[-1].file_id,
+            getattr(message.photo[-1], "file_size", None),
+        )
+    except Exception as exc:
+        reply_download_error(message, exc)
         return
     handle_incoming_image(message, data, "image/jpeg", message.caption or "")
 
@@ -1046,10 +1161,23 @@ def handle_document(message: types.Message) -> None:
         )
         return
 
+    if doc.file_size and doc.file_size > MAX_PDF_BYTES:
+        bot.reply_to(
+            message,
+            "❌ Файл больше 20 МБ — Telegram не даёт боту скачать такой файл. "
+            "Сожмите PDF и отправьте снова.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     try:
-        data = download_telegram_bytes(doc.file_id)
-    except Exception:
-        bot.reply_to(message, "❌ Не удалось скачать файл.", reply_markup=main_menu_keyboard())
+        data = download_telegram_bytes(doc.file_id, doc.file_size)
+    except Exception as exc:
+        reply_download_error(message, exc)
+        return
+
+    if looks_like_pdf(filename, mime) or data.lstrip().startswith(b"%PDF"):
+        handle_incoming_pdf(message, data, filename if filename.lower().endswith(".pdf") else f"{filename}.pdf")
         return
 
     if mime in IMAGE_MIMES or guess_image_mime(filename) in IMAGE_MIMES:
@@ -1067,16 +1195,17 @@ def handle_document(message: types.Message) -> None:
             )
             return
         caption = (message.caption or "").strip() or f"Обработай приложенный файл {filename}"
-        prompt = append_text_file_to_prompt(caption, filename, content)
         pending = _pending_prompt.pop(chat_id, None)
-        imgs = pop_pending_images(chat_id)
-        dispatch_task(chat_id, user_id, prompt, pending, imgs or None)
+        prompt = append_text_file_to_prompt(caption, filename, content)
+        prompt, images = consume_pending_attachments(chat_id, prompt)
+        dispatch_task(chat_id, user_id, prompt, pending, images or None)
         return
 
     bot.reply_to(
         message,
         "❌ Формат не поддерживается.\n"
-        "Отправьте изображение (PNG/JPEG/GIF/WebP) или текстовый файл (.txt, .md, .json, .py).",
+        "Отправьте PDF, изображение (PNG/JPEG/GIF/WebP) или текстовый файл "
+        "(.txt, .md, .json, .py).",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -1089,7 +1218,6 @@ def handle_text(message: types.Message) -> None:
     user_id = message.from_user.id
     prompt = message.text.strip()
     pending = _pending_prompt.pop(chat_id, None)
-    images = pop_pending_images(chat_id)
 
     if pending == "repo":
         result = apply_repo_url(chat_id, prompt)
@@ -1104,8 +1232,11 @@ def handle_text(message: types.Message) -> None:
         bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
-    if images and not prompt:
+    prompt, images = consume_pending_attachments(chat_id, prompt)
+    if not prompt and images:
         prompt = IMAGE_ONLY_PROMPT
+    if not prompt and not images:
+        return
 
     if pending == "new":
         start_task(chat_id, user_id, prompt, force_new=True, images=images or None)
@@ -1117,6 +1248,10 @@ def handle_text(message: types.Message) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     print("Cursor Telegram Bot starting…")
     print(f"DEFAULT_REPO: {bool(DEFAULT_REPO_URL)}")
     register_bot_commands()

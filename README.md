@@ -1,23 +1,39 @@
 # Cursor Telegram Bot
 
-## 👉 [ДАЛЬШЕ.md](./ДАЛЬШЕ.md) — что делать сейчас (без повторных инструкций)
+Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](https://cursor.com/agents). Работает 24/7 в облаке, без вашего ПК.
 
-Код бота **уже готов**. Откройте папку в Cursor — агент прочитает `ДАЛЬШЕ.md` и продолжит с вашего шага, а не «с нуля».
-
----
-
-Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](https://cursor.com/agents). Работает **24/7 в облаке**, без вашего ПК.
-
-Отдельный проект от [ocr-bot](https://github.com/Nikita34196/ocr-bot) (распознавание текста).
+Отправляйте задачи текстом, фото **и PDF**. PDF скачивается из Telegram, из него извлекается текст и скриншоты страниц — это передаётся Cloud Agent.
 
 ## Возможности
 
 - Создание Cloud Agent по текстовой задаче
-- Продолжение диалога с тем же агентом (как в веб-версии)
-- Стриминг прогресса в сообщение Telegram
-- Ссылка на агента в браузере и на PR после завершения
+- Продолжение диалога с тем же агентом
+- Стриминг прогресса в Telegram
+- **PDF:** бот качает файл, разбирает его и передаёт содержимое в Cursor
+- Фото (PNG/JPEG/GIF/WebP) как изображения промпта
+- Ссылка на агента и на PR после завершения
 - Репозиторий и ветка на чат: `/repo`, `/branch`
 - Лимит задач в сутки на пользователя
+
+## PDF → Cursor
+
+Cloud Agents API принимает в промпте только изображения, не бинарный PDF. Поэтому бот:
+
+1. Скачивает документ из Telegram (до 20 МБ).
+2. Извлекает текст (до 80 страниц).
+3. Рендерит первые страницы в PNG и прикладывает их как `prompt.images` (до 5 вместе с фото).
+4. Кладёт текст PDF в промпт агента.
+
+Так агент видит и текст, и внешний вид страниц (в том числе сканы без текстового слоя).
+
+**Как отправить:**
+
+```
+1. Перешлите PDF боту (можно с подписью-задачей).
+2. Или сначала PDF, потом текст: «сделай конспект» / «внедри это ТЗ».
+```
+
+Лимиты: до 3 PDF в очереди, пароль на файле не поддерживается.
 
 ## Требования
 
@@ -30,8 +46,7 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 
 1. Форкните или склонируйте этот репозиторий на GitHub.
 2. Зайдите на [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**.
-3. Выберите репозиторий `cursor-bot`.
-4. **Variables** (Settings → Variables):
+3. **Variables** (Settings → Variables):
 
 | Переменная | Обязательно | Описание |
 |------------|-------------|----------|
@@ -45,7 +60,7 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 
 \* Если не задан — каждый пользователь указывает `/repo` сам.
 
-5. Deploy. Бот сразу начнёт polling.
+4. Deploy. Бот сразу начнёт polling.
 
 ### Telegram user id
 
@@ -61,8 +76,15 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 
 ```
 /start
-/repo https://github.com/Nikita34196/ocr-bot
+/repo https://github.com/owner/repo
 Добавь в README раздел про деплой на Railway
+```
+
+PDF:
+
+```
+(отправьте файл brief.pdf с подписью)
+Собери конспект и список задач из этого PDF
 ```
 
 или новая сессия:
@@ -74,6 +96,7 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 | Команда | Действие |
 |---------|----------|
 | Текст | Продолжить текущего агента |
+| PDF / фото | Скачать вложение и передать в Cursor |
 | `/new …` | Новый Cloud Agent |
 | `/repo URL` | Репозиторий GitHub |
 | `/branch main` | Ветка |
@@ -95,17 +118,27 @@ Telegram-бот для **Cursor Cloud Agents** — как [cursor.com/agents](ht
 ```bash
 cp .env.example .env
 # отредактируйте .env
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 export $(grep -v '^#' .env | xargs)
 python bot.py
 ```
 
+Тесты разбора PDF:
+
+```bash
+python -m unittest tests.test_pdf_attachments
+```
+
 ## Структура
 
 ```
-cursor_client.py  — Cloud Agents API v1
-storage.py        — SQLite (сессии, лимиты)
-bot.py            — Telegram handlers
+cursor_client.py    — Cloud Agents API v1
+storage.py          — SQLite (сессии, лимиты)
+telegram_files.py     — скачивание вложений из Telegram
+pdf_attachments.py  — разбор PDF → текст + скриншоты
+bot.py              — Telegram handlers
 ```
 
 ## Лицензия
