@@ -28,10 +28,9 @@ def format_download_error(exc: BaseException, token: str = "") -> str:
         text = text.replace(token, "***")
     lowered = text.lower()
     if "too big" in lowered or "file is too big" in lowered:
-        return (
-            "Файл больше 20 МБ — Telegram Bot API не отдаёт такие файлы боту. "
-            "Сожмите PDF и отправьте снова."
-        )
+        from pdf_urls import TOO_BIG_FOR_TELEGRAM
+
+        return TOO_BIG_FOR_TELEGRAM
     if "timed out" in lowered or "timeout" in lowered:
         return "Таймаут при скачивании из Telegram. Попробуйте ещё раз."
     if "forbidden" in lowered or " 403" in lowered or lowered.endswith("403"):
@@ -62,10 +61,9 @@ def download_telegram_file(
 ) -> bytes:
     """Fetch file bytes via TeleBot, with an HTTP fallback that URL-encodes the path."""
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
-        raise TelegramDownloadError(
-            "Файл больше 20 МБ — Telegram не даёт боту его скачать. "
-            "Сожмите PDF и отправьте снова."
-        )
+        from pdf_urls import TOO_BIG_FOR_TELEGRAM
+
+        raise TelegramDownloadError(TOO_BIG_FOR_TELEGRAM)
 
     try:
         info = bot.get_file(file_id)

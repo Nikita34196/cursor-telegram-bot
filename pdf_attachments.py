@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import pymupdf
 
-MAX_PDF_BYTES = 20 * 1024 * 1024  # Telegram Bot API download limit
+MAX_PDF_BYTES = 80 * 1024 * 1024  # after Telegram or public URL download
 MAX_PDF_TEXT_CHARS = 80_000
 MAX_PDF_PAGES_FOR_TEXT = 80
 MAX_PROMPT_CHARS = 100_000
@@ -80,7 +80,7 @@ def parse_pdf(
         raise PdfAttachmentError("PDF пустой.")
     if len(data) > MAX_PDF_BYTES:
         raise PdfAttachmentError(
-            f"PDF больше {MAX_PDF_BYTES // (1024 * 1024)} МБ — Telegram не отдаёт такие файлы боту."
+            f"PDF больше {MAX_PDF_BYTES // (1024 * 1024)} МБ — такой файл бот не обрабатывает."
         )
     if not is_pdf_bytes(data):
         raise PdfAttachmentError("Это не PDF (нет сигнатуры %PDF).")

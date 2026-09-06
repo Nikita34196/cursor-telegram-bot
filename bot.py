@@ -25,15 +25,25 @@ from cursor_client import (
     terminal_statuses,
 )
 from pdf_attachments import (
-    MAX_PDF_BYTES,
     PdfAttachmentError,
     ParsedPdf,
     looks_like_pdf,
     merge_into_prompt,
     parse_pdf,
 )
+from pdf_urls import (
+    TOO_BIG_FOR_TELEGRAM,
+    PdfUrlError,
+    download_pdf_from_url,
+    extract_pdf_urls,
+    strip_urls,
+)
 from storage import Storage
-from telegram_files import TelegramDownloadError, download_telegram_file
+from telegram_files import (
+    TELEGRAM_BOT_FILE_LIMIT,
+    TelegramDownloadError,
+    download_telegram_file,
+)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -512,8 +522,8 @@ def help_text() -> str:
         "🛑 Отмена / 🔄 Сброс\n\n"
         "📷 **Файлы:** фото (PNG/JPEG/GIF/WebP) и **PDF** — "
         "с подписью-задачей или несколько файлов, затем текст.\n"
-        "📄 PDF скачивается из Telegram, из него извлекается текст и "
-        "скриншоты страниц — это уходит в Cloud Agent.\n"
+        "📄 PDF из чата — до 20 МБ (лимит Telegram). Более крупные — "
+        "пришлите публичную ссылку (Google Drive / Dropbox / Яндекс Диск / прямой .pdf).\n"
         "📎 Cursor может вернуть файлы из `artifacts/` после задачи.\n\n"
         f"Лимит: {MAX_DAILY_RUNS} задач/день."
     )
@@ -930,6 +940,8 @@ def cmd_new(message: types.Message) -> None:
             reply_markup=main_menu_keyboard(),
         )
         return
+    if ingest_pdf_from_urls(message, prompt, "new"):
+        return
     prompt, images = consume_pending_attachments(message.chat.id, prompt)
     start_task(
         message.chat.id,
@@ -1088,6 +1100,7 @@ def handle_incoming_pdf(
     message: types.Message,
     data: bytes,
     filename: str,
+    caption: str | None = None,
 ) -> None:
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -1106,11 +1119,11 @@ def handle_incoming_pdf(
         bot.reply_to(message, f"❌ {e}", reply_markup=main_menu_keyboard())
         return
 
-    caption = (message.caption or "").strip()
-    if caption:
+    caption_text = (caption if caption is not None else (message.caption or "")).strip()
+    if caption_text:
         _pending_prompt.pop(chat_id, None)
         prompt, images = consume_pending_attachments(
-            chat_id, caption, extra_pdfs=[parsed]
+            chat_id, caption_text, extra_pdfs=[parsed]
         )
         dispatch_task(chat_id, user_id, prompt, pending, images or None)
         return
@@ -1125,6 +1138,52 @@ def handle_incoming_pdf(
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
+
+
+def ingest_pdf_from_urls(message: types.Message, text: str, pending: str | None) -> bool:
+    """Download a PDF from a public URL. Returns True if the message was a PDF link."""
+    urls = extract_pdf_urls(text)
+    if not urls:
+        return False
+    chat_id = message.chat.id
+    leftover = strip_urls(text, urls)
+    if pending in ("new", "continue"):
+        _pending_prompt[chat_id] = pending
+    status = bot.reply_to(
+        message,
+        "⏬ Скачиваю PDF по ссылке…",
+        reply_markup=main_menu_keyboard(),
+    )
+    try:
+        downloaded = download_pdf_from_url(urls[0])
+    except PdfUrlError as exc:
+        bot.edit_message_text(
+            f"❌ {exc}",
+            chat_id,
+            status.message_id,
+            reply_markup=main_menu_keyboard(),
+        )
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).exception("URL PDF download failed")
+        bot.edit_message_text(
+            f"❌ Не удалось скачать PDF по ссылке: {str(exc)[:280]}",
+            chat_id,
+            status.message_id,
+            reply_markup=main_menu_keyboard(),
+        )
+        return True
+    try:
+        bot.delete_message(chat_id, status.message_id)
+    except Exception:
+        pass
+    extra = ""
+    if len(urls) > 1:
+        extra = " (взял первую ссылку)"
+    if extra:
+        bot.send_message(chat_id, f"📄 Скачал PDF{extra}.", reply_markup=main_menu_keyboard())
+    handle_incoming_pdf(message, downloaded.data, downloaded.filename, caption=leftover)
+    return True
 
 
 @bot.message_handler(content_types=["photo"])
@@ -1161,11 +1220,10 @@ def handle_document(message: types.Message) -> None:
         )
         return
 
-    if doc.file_size and doc.file_size > MAX_PDF_BYTES:
+    if doc.file_size and doc.file_size > TELEGRAM_BOT_FILE_LIMIT:
         bot.reply_to(
             message,
-            "❌ Файл больше 20 МБ — Telegram не даёт боту скачать такой файл. "
-            "Сожмите PDF и отправьте снова.",
+            f"❌ {TOO_BIG_FOR_TELEGRAM}",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -1230,6 +1288,9 @@ def handle_text(message: types.Message) -> None:
         if result and result.startswith("❌"):
             _pending_prompt[chat_id] = "branch"
         bot.reply_to(message, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+
+    if ingest_pdf_from_urls(message, prompt, pending):
         return
 
     prompt, images = consume_pending_attachments(chat_id, prompt)
