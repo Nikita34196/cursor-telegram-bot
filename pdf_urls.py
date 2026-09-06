@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -14,6 +14,10 @@ MAX_URL_PDF_BYTES = 80 * 1024 * 1024
 USER_AGENT = (
     "Mozilla/5.0 (compatible; CursorTelegramBot/1.0; +https://github.com/Nikita34196/cursor-telegram-bot)"
 )
+# OneDrive blocks some bot UAs on the share-redeem flow.
+ONEDRIVE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0"
+)
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 DRIVE_FILE_RE = re.compile(
     r"https?://(?:drive|docs)\.google\.com/(?:file/d/|open\?id=|uc\?.*?id=)([a-zA-Z0-9_-]+)",
@@ -21,11 +25,18 @@ DRIVE_FILE_RE = re.compile(
 )
 DRIVE_ID_RE = re.compile(r"(?:/file/d/|[?&]id=)([a-zA-Z0-9_-]+)", re.IGNORECASE)
 
+# Browser app id used by unauthenticated OneDrive / SharePoint personal shares.
+ONEDRIVE_BADGER_APP_ID = "1141147648"
+ONEDRIVE_BADGER_APP_UUID = "5cbed6ac-a083-4e14-b191-b4ba07653de2"
+ONEDRIVE_BADGER_URL = "https://api-badgerp.svc.ms/v1.0/token"
+ONEDRIVE_PERSONAL_SHARE_API = "https://my.microsoftpersonalcontent.com/_api/v2.0/shares"
+
 TOO_BIG_FOR_TELEGRAM = (
     "Этот файл больше 20 МБ — Telegram не отдаёт такие вложения боту "
     "(лимит Bot API).\n\n"
     "Отправьте публичную ссылку на PDF — бот скачает его сам (до 80 МБ):\n"
     "• Google Drive (доступ «любой, у кого есть ссылка»)\n"
+    "• OneDrive (1drv.ms)\n"
     "• Dropbox\n"
     "• Яндекс Диск\n"
     "• прямой URL на файл .pdf\n\n"
@@ -53,6 +64,23 @@ def extract_urls(text: str) -> list[str]:
     return found
 
 
+def _host(url: str) -> str:
+    return urlparse(url).netloc.lower()
+
+
+def is_onedrive_url(url: str) -> bool:
+    host = _host(url)
+    if host == "1drv.ms" or host.endswith(".1drv.ms"):
+        return True
+    if "onedrive.live.com" in host or host.endswith("1drv.ws"):
+        return True
+    if "sharepoint.com" in host:
+        return True
+    if "microsoftpersonalcontent.com" in host:
+        return True
+    return False
+
+
 def looks_like_pdf_url(url: str) -> bool:
     low = url.lower()
     path = urlparse(url).path.lower()
@@ -64,6 +92,8 @@ def looks_like_pdf_url(url: str) -> bool:
     if "dropbox.com" in host or "dropboxusercontent.com" in host:
         return True
     if "disk.yandex." in host or host.endswith("yadi.sk") or "yadi.sk" in host:
+        return True
+    if is_onedrive_url(url):
         return True
     return False
 
@@ -117,6 +147,156 @@ def _filename_from_response(resp: requests.Response, fallback: str) -> str:
     if path.lower().endswith(".pdf"):
         return unquote(path.rsplit("/", 1)[-1]) or fallback
     return fallback
+
+
+@dataclass
+class _OneDriveShare:
+    redeem: str = ""
+    cid: str = ""
+    resid: str = ""
+    authkey: str = ""
+
+
+def _onedrive_share_from_url(url: str) -> _OneDriveShare:
+    query = parse_qs(urlparse(url).query)
+    redeem = (query.get("redeem") or [""])[0]
+    cid = (query.get("cid") or [""])[0]
+    resid = (query.get("resid") or query.get("id") or [""])[0]
+    authkey = (query.get("authkey") or [""])[0]
+    if not resid and "!" in (query.get("id") or [""])[0]:
+        resid = query["id"][0]
+    if not cid and "!" in resid:
+        cid = resid.split("!", 1)[0]
+    return _OneDriveShare(redeem=redeem, cid=cid, resid=resid, authkey=authkey)
+
+
+def _onedrive_badger_token(session: requests.Session) -> str | None:
+    try:
+        resp = session.post(
+            ONEDRIVE_BADGER_URL,
+            headers={"AppId": ONEDRIVE_BADGER_APP_ID, "Content-Type": "application/json"},
+            json={"appId": ONEDRIVE_BADGER_APP_UUID},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    try:
+        token = resp.json().get("token")
+    except ValueError:
+        return None
+    return token if isinstance(token, str) and token else None
+
+
+def _onedrive_item_via_redeem(session: requests.Session, redeem: str, token: str) -> dict | None:
+    try:
+        resp = session.get(
+            f"{ONEDRIVE_PERSONAL_SHARE_API}/u!{redeem}/driveitem",
+            headers={"Authorization": f"Badger {token}", "Prefer": "autoredeem"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _onedrive_item_via_authkey(session: requests.Session, share: _OneDriveShare) -> dict | None:
+    if not (share.cid and share.resid):
+        return None
+    params = {}
+    if share.authkey:
+        params["authkey"] = share.authkey
+    try:
+        resp = session.get(
+            f"https://api.onedrive.com/v1.0/drives/{share.cid}/items/{share.resid}",
+            params=params or None,
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _download_onedrive_pdf(
+    url: str,
+    session: requests.Session,
+    *,
+    max_bytes: int,
+) -> DownloadedPdf:
+    session.headers.update({"User-Agent": ONEDRIVE_USER_AGENT})
+    try:
+        landing = session.get(url, timeout=60, allow_redirects=True)
+    except requests.RequestException as exc:
+        raise PdfUrlError(f"Не удалось открыть ссылку OneDrive: {exc}") from exc
+
+    if is_pdf_bytes(landing.content):
+        filename = _filename_from_response(landing, "document.pdf")
+        if len(landing.content) > max_bytes:
+            raise PdfUrlError(
+                f"PDF по ссылке больше {max_bytes // (1024 * 1024)} МБ — это лимит бота на скачивание."
+            )
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{filename}.pdf"
+        return DownloadedPdf(data=landing.content, filename=filename, source_url=url)
+
+    share = _onedrive_share_from_url(landing.url)
+    if not share.redeem and not share.resid:
+        share = _onedrive_share_from_url(url)
+
+    item: dict | None = None
+    if share.redeem:
+        token = _onedrive_badger_token(session)
+        if token:
+            item = _onedrive_item_via_redeem(session, share.redeem, token)
+    if item is None:
+        item = _onedrive_item_via_authkey(session, share)
+
+    download_url = ""
+    filename = "document.pdf"
+    if item:
+        raw_name = item.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            filename = raw_name.strip()
+        raw_dl = item.get("@content.downloadUrl")
+        if isinstance(raw_dl, str) and raw_dl.startswith("http"):
+            download_url = raw_dl
+
+    if not download_url:
+        raise PdfUrlError(
+            "Не удалось скачать PDF с OneDrive. Сделайте ссылку публичной "
+            "(доступ «любой, у кого есть ссылка») и отправьте её ещё раз."
+        )
+
+    try:
+        resp = session.get(download_url, timeout=180, stream=True, allow_redirects=True)
+        resp.raise_for_status()
+        data = _read_limited(resp, max_bytes)
+        filename = _filename_from_response(resp, filename)
+    except PdfUrlError:
+        raise
+    except requests.RequestException as exc:
+        raise PdfUrlError(f"Не удалось скачать PDF с OneDrive: {exc}") from exc
+
+    if not is_pdf_bytes(data):
+        raise PdfUrlError(
+            "По ссылке OneDrive пришёл не PDF. Нужна публичная ссылка именно на PDF-файл."
+        )
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+    return DownloadedPdf(data=data, filename=filename, source_url=url)
 
 
 def _yandex_direct_url(public_url: str, session: requests.Session) -> str | None:
@@ -199,6 +379,9 @@ def download_pdf_from_url(url: str, *, max_bytes: int = MAX_URL_PDF_BYTES) -> Do
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    if is_onedrive_url(url):
+        return _download_onedrive_pdf(url, session, max_bytes=max_bytes)
+
     target = normalize_pdf_url(url)
     host = urlparse(url).netloc.lower()
     if "disk.yandex." in host or "yadi.sk" in host:
@@ -226,7 +409,7 @@ def download_pdf_from_url(url: str, *, max_bytes: int = MAX_URL_PDF_BYTES) -> Do
 
     if not is_pdf_bytes(data):
         raise PdfUrlError(
-            "По ссылке пришёл не PDF. Для Google Drive включите доступ "
+            "По ссылке пришёл не PDF. Для Google Drive / OneDrive включите доступ "
             "«любой, у кого есть ссылка», либо пришлите прямой URL на .pdf."
         )
     if not filename.lower().endswith(".pdf"):
