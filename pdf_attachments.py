@@ -24,6 +24,9 @@ RENDER_ZOOMS = (1.6, 1.2, 0.9, 0.6)
 PDF_ONLY_PROMPT = (
     "Прочитай приложенный PDF и выполни задачу по его содержимому."
 )
+WORD_ONLY_PROMPT = (
+    "Прочитай приложенный Word-документ и выполни задачу по его содержимому."
+)
 
 
 class PdfAttachmentError(Exception):
@@ -38,6 +41,7 @@ class ParsedPdf:
     text: str
     images: list[dict[str, str]] = field(default_factory=list)
     warning: str | None = None
+    kind: str = "pdf"
 
 
 def looks_like_pdf(filename: str | None, mime: str | None) -> bool:
@@ -145,11 +149,17 @@ def parse_pdf(
 
 def format_pdf_for_prompt(parsed: ParsedPdf) -> str:
     size_kb = max(1, parsed.size_bytes // 1024)
-    header = (
-        f"Пользователь приложил PDF-файл «{parsed.filename}» "
-        f"({parsed.page_count} стр., {size_kb} КБ).\n"
-        "Ниже извлечённый текст. Скриншоты страниц переданы как изображения промпта Cursor."
-    )
+    if parsed.kind == "word":
+        header = (
+            f"Пользователь приложил Word-файл «{parsed.filename}» ({size_kb} КБ).\n"
+            "Ниже извлечённый текст. Встроенные картинки (если были) переданы как изображения промпта Cursor."
+        )
+    else:
+        header = (
+            f"Пользователь приложил PDF-файл «{parsed.filename}» "
+            f"({parsed.page_count} стр., {size_kb} КБ).\n"
+            "Ниже извлечённый текст. Скриншоты страниц переданы как изображения промпта Cursor."
+        )
     if parsed.warning:
         header += f"\nПримечание: {parsed.warning}"
     if parsed.text.strip():
@@ -175,10 +185,13 @@ def merge_into_prompt(
 
     text = (prompt or "").strip()
     if not text and pdfs:
-        text = PDF_ONLY_PROMPT
+        if pdfs and all(item.kind == "word" for item in pdfs):
+            text = WORD_ONLY_PROMPT
+        else:
+            text = PDF_ONLY_PROMPT
     if blocks:
         extra = "\n\n".join(blocks)
         text = f"{text}\n\n{extra}" if text else extra
     if len(text) > MAX_PROMPT_CHARS:
-        text = text[:MAX_PROMPT_CHARS] + "\n\n[текст PDF обрезан]"
+        text = text[:MAX_PROMPT_CHARS] + "\n\n[текст вложения обрезан]"
     return text, out_images

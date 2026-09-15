@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 import requests
 
 from pdf_attachments import is_pdf_bytes
+from word_attachments import is_word_bytes
 
 MAX_URL_PDF_BYTES = 80 * 1024 * 1024
 USER_AGENT = (
@@ -25,12 +26,12 @@ DRIVE_ID_RE = re.compile(r"(?:/file/d/|[?&]id=)([a-zA-Z0-9_-]+)", re.IGNORECASE)
 TOO_BIG_FOR_TELEGRAM = (
     "Этот файл больше 20 МБ — Telegram не отдаёт такие вложения боту "
     "(лимит Bot API).\n\n"
-    "Отправьте публичную ссылку на PDF — бот скачает его сам (до 80 МБ):\n"
+    "Отправьте публичную ссылку на PDF или Word — бот скачает его сам (до 80 МБ):\n"
     "• Google Drive (доступ «любой, у кого есть ссылка»)\n"
     "• OneDrive / 1drv.ms\n"
     "• Dropbox\n"
     "• Яндекс Диск\n"
-    "• прямой URL на файл .pdf\n\n"
+    "• прямой URL на .pdf / .docx\n\n"
     "Пример: сделай конспект https://1drv.ms/b/…"
 )
 
@@ -63,7 +64,9 @@ def looks_like_pdf_url(url: str) -> bool:
     low = url.lower()
     path = urlparse(url).path.lower()
     host = urlparse(url).netloc.lower()
-    if path.endswith(".pdf") or ".pdf?" in low:
+    if path.endswith((".pdf", ".doc", ".docx")) or any(
+        ext in low for ext in (".pdf?", ".doc?", ".docx?")
+    ):
         return True
     if "drive.google.com" in host or "docs.google.com" in host:
         return bool(DRIVE_ID_RE.search(url))
@@ -214,7 +217,7 @@ def _drive_confirm_retry(session: requests.Session, html: bytes, file_id: str) -
     )
     resp.raise_for_status()
     data = _read_limited(resp, MAX_URL_PDF_BYTES)
-    return data if is_pdf_bytes(data) else None
+    return data if is_pdf_bytes(data) or is_word_bytes(data) else None
 
 
 def _onedrive_badger_token(session: requests.Session) -> str:
@@ -266,7 +269,7 @@ def _download_onedrive(
         raise PdfUrlError(
             f"PDF по ссылке больше {max_bytes // (1024 * 1024)} МБ — это лимит бота на скачивание."
         )
-    filename = str(info.get("name") or "document.pdf")
+    filename = str(info.get("name") or "document")
 
     try:
         resp = session.get(
@@ -281,18 +284,14 @@ def _download_onedrive(
     except PdfUrlError:
         raise
     except requests.RequestException as exc:
-        raise PdfUrlError(f"Не удалось скачать PDF с OneDrive: {exc}") from exc
+        raise PdfUrlError(f"Не удалось скачать файл с OneDrive: {exc}") from exc
 
-    if not is_pdf_bytes(data):
-        raise PdfUrlError("По ссылке OneDrive пришёл не PDF.")
-    if not filename.lower().endswith(".pdf"):
-        filename = f"{filename}.pdf"
-    return DownloadedPdf(data=data, filename=filename, source_url=url)
+    return _as_downloaded_document(data, filename, url)
 
 
 def download_pdf_from_url(url: str, *, max_bytes: int = MAX_URL_PDF_BYTES) -> DownloadedPdf:
     if not url.lower().startswith(("http://", "https://")):
-        raise PdfUrlError("Нужна ссылка http(s) на PDF.")
+        raise PdfUrlError("Нужна ссылка http(s) на PDF или Word.")
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
@@ -309,25 +308,35 @@ def download_pdf_from_url(url: str, *, max_bytes: int = MAX_URL_PDF_BYTES) -> Do
         resp = session.get(target, timeout=180, stream=True, allow_redirects=True)
         resp.raise_for_status()
         data = _read_limited(resp, max_bytes)
-        filename = _filename_from_response(resp, "document.pdf")
+        filename = _filename_from_response(resp, "document")
         content_type = resp.headers.get("Content-Type", "")
     except PdfUrlError:
         raise
     except requests.RequestException as exc:
-        raise PdfUrlError(f"Не удалось скачать PDF по ссылке: {exc}") from exc
+        raise PdfUrlError(f"Не удалось скачать файл по ссылке: {exc}") from exc
 
     file_id = drive_file_id(url)
     if file_id and _is_html(data, content_type):
         retry = _drive_confirm_retry(session, data, file_id)
         if retry:
             data = retry
-            filename = filename if filename.lower().endswith(".pdf") else f"{file_id}.pdf"
+            filename = filename if "." in filename else file_id
 
-    if not is_pdf_bytes(data):
-        raise PdfUrlError(
-            "По ссылке пришёл не PDF. Для Google Drive включите доступ "
-            "«любой, у кого есть ссылка», либо пришлите прямой URL на .pdf."
-        )
-    if not filename.lower().endswith(".pdf"):
-        filename = f"{filename}.pdf"
-    return DownloadedPdf(data=data, filename=filename, source_url=url)
+    return _as_downloaded_document(data, filename, url)
+
+
+def _as_downloaded_document(data: bytes, filename: str, source_url: str) -> DownloadedPdf:
+    name = filename or "document"
+    low = name.lower()
+    if is_pdf_bytes(data):
+        if not low.endswith(".pdf"):
+            name = f"{name}.pdf"
+        return DownloadedPdf(data=data, filename=name, source_url=source_url)
+    if is_word_bytes(data):
+        if not low.endswith((".doc", ".docx", ".dotx")):
+            name = f"{name}.docx" if data.startswith(b"PK") else f"{name}.doc"
+        return DownloadedPdf(data=data, filename=name, source_url=source_url)
+    raise PdfUrlError(
+        "По ссылке пришёл не PDF и не Word. Для облака включите доступ "
+        "«любой, у кого есть ссылка», либо пришлите прямой URL на .pdf/.docx."
+    )

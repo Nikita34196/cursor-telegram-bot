@@ -9,5 +9,7 @@ Telegram-бот для Cursor Cloud Agents.
 
 PDF: бот скачивает файл из Telegram (`handle_document` → `parse_pdf`) и передаёт содержимое в Cursor через промпт и `prompt.images` (скриншоты страниц). API Cloud Agents не принимает бинарный PDF напрямую.
 
-Код: `bot.py`, `cursor_client.py`, `storage.py`, `pdf_attachments.py`.
+Word (.doc/.docx): `handle_document` → `parse_word` — текст и встроенные картинки уходят в тот же промпт.
+
+Код: `bot.py`, `cursor_client.py`, `storage.py`, `pdf_attachments.py`, `word_attachments.py`.
 

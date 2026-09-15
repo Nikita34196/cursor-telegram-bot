@@ -44,6 +44,12 @@ from telegram_files import (
     TelegramDownloadError,
     download_telegram_file,
 )
+from word_attachments import (
+    WordAttachmentError,
+    is_word_bytes,
+    looks_like_word,
+    parse_word,
+)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -520,10 +526,10 @@ def help_text() -> str:
         "📊 Статус / 🔗 Ссылка / ⚙️ Настройки\n"
         "📦 Репозиторий / 🌿 Ветка\n"
         "🛑 Отмена / 🔄 Сброс\n\n"
-        "📷 **Файлы:** фото (PNG/JPEG/GIF/WebP) и **PDF** — "
+        "📷 **Файлы:** фото (PNG/JPEG/GIF/WebP), **PDF** и **Word** (.doc/.docx) — "
         "с подписью-задачей или несколько файлов, затем текст.\n"
-        "📄 PDF из чата — до 20 МБ (лимит Telegram). Более крупные — "
-        "пришлите публичную ссылку (Google Drive / OneDrive / Dropbox / Яндекс Диск / прямой .pdf).\n"
+        "📄 Из чата — до 20 МБ (лимит Telegram). Более крупные — "
+        "пришлите публичную ссылку (Google Drive / OneDrive / Dropbox / Яндекс Диск / прямой .pdf/.docx).\n"
         "📎 Cursor может вернуть файлы из `artifacts/` после задачи.\n\n"
         f"Лимит: {MAX_DAILY_RUNS} задач/день."
     )
@@ -1130,9 +1136,59 @@ def handle_incoming_pdf(
 
     count = add_pending_pdf(chat_id, parsed)
     extra = f"\n{parsed.warning}" if parsed.warning else ""
+    kind_label = "Word" if parsed.kind == "word" else "PDF"
+    pages = (
+        f"{parsed.page_count} стр."
+        if parsed.kind != "word"
+        else f"{len(parsed.text)} симв."
+    )
     bot.reply_to(
         message,
-        f"📄 PDF добавлен: `{filename}` ({parsed.page_count} стр.)\n"
+        f"📄 {kind_label} добавлен: `{filename}` ({pages})\n"
+        f"В очереди: {count}/{MAX_PENDING_PDFS}.{extra}\n"
+        "Напишите задачу или отправьте ещё файлы — содержимое уйдёт в Cursor.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+def handle_incoming_word(
+    message: types.Message,
+    data: bytes,
+    filename: str,
+    caption: str | None = None,
+) -> None:
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    pending = _pending_prompt.get(chat_id)
+    if pending in ("repo", "branch"):
+        bot.reply_to(
+            message,
+            "Сначала завершите настройку репозитория/ветки текстом.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        parsed = parse_word(data, filename, max_images=MAX_IMAGES)
+    except WordAttachmentError as e:
+        bot.reply_to(message, f"❌ {e}", reply_markup=main_menu_keyboard())
+        return
+
+    caption_text = (caption if caption is not None else (message.caption or "")).strip()
+    if caption_text:
+        _pending_prompt.pop(chat_id, None)
+        prompt, images = consume_pending_attachments(
+            chat_id, caption_text, extra_pdfs=[parsed]
+        )
+        dispatch_task(chat_id, user_id, prompt, pending, images or None)
+        return
+
+    count = add_pending_pdf(chat_id, parsed)
+    extra = f"\n{parsed.warning}" if parsed.warning else ""
+    bot.reply_to(
+        message,
+        f"📄 Word добавлен: `{filename}`\n"
         f"В очереди: {count}/{MAX_PENDING_PDFS}.{extra}\n"
         "Напишите задачу или отправьте ещё файлы — содержимое уйдёт в Cursor.",
         parse_mode="Markdown",
@@ -1151,7 +1207,7 @@ def ingest_pdf_from_urls(message: types.Message, text: str, pending: str | None)
         _pending_prompt[chat_id] = pending
     status = bot.reply_to(
         message,
-        "⏬ Скачиваю PDF по ссылке…",
+        "⏬ Скачиваю файл по ссылке…",
         reply_markup=main_menu_keyboard(),
     )
     try:
@@ -1167,7 +1223,7 @@ def ingest_pdf_from_urls(message: types.Message, text: str, pending: str | None)
     except Exception as exc:
         logging.getLogger(__name__).exception("URL PDF download failed")
         bot.edit_message_text(
-            f"❌ Не удалось скачать PDF по ссылке: {str(exc)[:280]}",
+            f"❌ Не удалось скачать файл по ссылке: {str(exc)[:280]}",
             chat_id,
             status.message_id,
             reply_markup=main_menu_keyboard(),
@@ -1181,7 +1237,13 @@ def ingest_pdf_from_urls(message: types.Message, text: str, pending: str | None)
     if len(urls) > 1:
         extra = " (взял первую ссылку)"
     if extra:
-        bot.send_message(chat_id, f"📄 Скачал PDF{extra}.", reply_markup=main_menu_keyboard())
+        bot.send_message(chat_id, f"📄 Скачал файл{extra}.", reply_markup=main_menu_keyboard())
+    if is_word_bytes(downloaded.data) or looks_like_word(downloaded.filename, None):
+        if not looks_like_pdf(downloaded.filename, None) and not downloaded.data.lstrip().startswith(b"%PDF"):
+            handle_incoming_word(
+                message, downloaded.data, downloaded.filename, caption=leftover
+            )
+            return True
     handle_incoming_pdf(message, downloaded.data, downloaded.filename, caption=leftover)
     return True
 
@@ -1238,6 +1300,12 @@ def handle_document(message: types.Message) -> None:
         handle_incoming_pdf(message, data, filename if filename.lower().endswith(".pdf") else f"{filename}.pdf")
         return
 
+    if looks_like_word(filename, mime) or is_word_bytes(data):
+        if not filename.lower().endswith((".doc", ".docx", ".dotx")):
+            filename = f"{filename}.docx" if data.startswith(b"PK") else f"{filename}.doc"
+        handle_incoming_word(message, data, filename)
+        return
+
     if mime in IMAGE_MIMES or guess_image_mime(filename) in IMAGE_MIMES:
         image_mime = mime if mime in IMAGE_MIMES else guess_image_mime(filename)
         handle_incoming_image(message, data, image_mime, message.caption or "")
@@ -1262,7 +1330,7 @@ def handle_document(message: types.Message) -> None:
     bot.reply_to(
         message,
         "❌ Формат не поддерживается.\n"
-        "Отправьте PDF, изображение (PNG/JPEG/GIF/WebP) или текстовый файл "
+        "Отправьте PDF, Word (.doc/.docx), изображение (PNG/JPEG/GIF/WebP) или текстовый файл "
         "(.txt, .md, .json, .py).",
         reply_markup=main_menu_keyboard(),
     )

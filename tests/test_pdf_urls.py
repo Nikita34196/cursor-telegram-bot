@@ -49,6 +49,11 @@ class UrlDetectTests(unittest.TestCase):
         self.assertFalse(looks_like_pdf_url("https://github.com/foo/bar"))
         self.assertEqual(extract_pdf_urls("смотри https://github.com/foo/bar"), [])
 
+    def test_direct_docx(self) -> None:
+        url = "https://example.com/docs/spec.docx"
+        self.assertTrue(looks_like_pdf_url(url))
+        self.assertEqual(extract_pdf_urls(f"обработай {url}"), [url])
+
 
 class FakeResp:
     def __init__(self, content: bytes, content_type: str, filename: str | None = None) -> None:
